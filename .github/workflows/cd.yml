@@ -1,0 +1,152 @@
+# ============================================================
+# CD — Tự động deploy
+#
+# dev  → push → deploy lên Staging (môi trường test)
+# main → push → deploy lên Production (môi trường thật)
+# ============================================================
+
+name: CD
+
+on:
+  push:
+    branches:
+      - dev   # push vào dev → deploy staging
+      - main  # push vào main → deploy production
+
+env:
+  # Địa chỉ Docker registry (GitHub Container Registry)
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}   # vd: huynhha17/menuscan
+
+jobs:
+
+  # ──────────────────────────────────────────────────────────
+  # BƯỚC 1: Build Docker image và đẩy lên registry
+  # Chạy cho cả 2 nhánh dev và main
+  # ──────────────────────────────────────────────────────────
+  build:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write   # cần quyền này để push lên ghcr.io
+
+    outputs:
+      # Truyền tag image sang job deploy
+      image_tag: ${{ steps.set-tag.outputs.tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Đặt tag theo tên nhánh: "staging" hoặc "production"
+      - name: Xác định tag image
+        id: set-tag
+        run: |
+          if [ "${{ github.ref_name }}" == "main" ]; then
+            echo "tag=production" >> $GITHUB_OUTPUT
+          else
+            echo "tag=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Đăng nhập vào GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build và push từng service
+      - name: Build & Push — Backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/backend:${{ steps.set-tag.outputs.tag }}
+
+      - name: Build & Push — Frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/frontend:${{ steps.set-tag.outputs.tag }}
+
+      - name: Build & Push — OCR
+        uses: docker/build-push-action@v5
+        with:
+          context: ./ocr
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/ocr:${{ steps.set-tag.outputs.tag }}
+
+  # ──────────────────────────────────────────────────────────
+  # BƯỚC 2A: Deploy lên STAGING (khi push vào nhánh dev)
+  # ──────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy → Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref_name == 'dev'
+
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+
+    steps:
+      - name: SSH vào server Staging và deploy
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            cd /opt/menuscan
+
+            # Kéo image mới nhất
+            docker compose pull
+
+            # Khởi động lại các service
+            docker compose up -d
+
+            # Chạy migration database
+            docker compose exec -T backend alembic upgrade head
+
+            echo "✅ Staging đã deploy thành công!"
+
+  # ──────────────────────────────────────────────────────────
+  # BƯỚC 2B: Deploy lên PRODUCTION (khi push vào nhánh main)
+  # ──────────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy → Production
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref_name == 'main'
+
+    environment:
+      name: production
+      url: ${{ vars.PROD_URL }}
+
+    steps:
+      - name: SSH vào server Production và deploy
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            cd /opt/menuscan
+
+            # Kéo image mới nhất
+            docker compose pull
+
+            # Khởi động lại các service
+            docker compose up -d
+
+            # Chạy migration database
+            docker compose exec -T backend alembic upgrade head
+
+            # Kiểm tra server có chạy không
+            sleep 10
+            curl -f http://localhost/api/health || exit 1
+
+            echo "✅ Production đã deploy thành công!"
